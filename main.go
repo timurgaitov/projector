@@ -6,8 +6,10 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -114,12 +116,12 @@ func fit(in string) string {
 	// Encode to a .part file and rename on success, so an interrupted/failed run
 	// never leaves a half-encoded <name>-ready.mp4 for the cache to reuse.
 	tmp := out + ".part"
-	err := ffmpeg(in, tmp, codecArgs(d))
+	err := ffmpeg(in, tmp, codecArgs(d), d.durSec)
 	if err != nil && d.ok && (d.vCopy || d.aCopy) {
 		// Streams that look fit can still refuse to copy into mp4 (bad
 		// timestamps, packed bitstreams); re-encoding regenerates them.
 		fmt.Fprintln(os.Stderr, "▶ Copy failed — retrying as a full transcode")
-		err = ffmpeg(in, tmp, codecArgs(decision{ok: true, vIdx: d.vIdx, aIdx: d.aIdx}))
+		err = ffmpeg(in, tmp, codecArgs(decision{ok: true, vIdx: d.vIdx, aIdx: d.aIdx}), d.durSec)
 	}
 	if err != nil {
 		os.Remove(tmp)
@@ -140,24 +142,75 @@ func isFit(d decision) bool {
 	return d.ok && d.isMP4 && d.vCopy && (d.aIdx < 0 || d.aCopy)
 }
 
-func ffmpeg(in, tmp string, codec []string) error {
+func ffmpeg(in, tmp string, codec []string, durSec float64) error {
 	argv := append([]string{"-hide_banner", "-loglevel", "error", "-nostats",
+		"-progress", "pipe:1", "-stats_period", "0.5",
 		"-y", "-i", in}, codec...)
 	argv = append(argv, "-movflags", "+faststart", "-f", "mp4", tmp)
 	cmd := exec.Command("ffmpeg", argv...)
 	cmd.Stderr = os.Stderr // ffmpeg is quiet now; only real errors reach here
-	return cmd.Run()
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	showProgress(out, durSec)
+	return cmd.Wait()
+}
+
+// showProgress renders ffmpeg's -progress key=value feed as one line updated
+// in place: percent and ETA when the input duration is known, otherwise just
+// position and encode speed. Values within a block arrive in a fixed order
+// ending with "progress=", so that key triggers the redraw.
+func showProgress(r io.Reader, durSec float64) {
+	var pos, speed float64 // seconds encoded; encode speed vs realtime
+	shown := false
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		k, v, _ := strings.Cut(sc.Text(), "=")
+		switch k {
+		case "out_time_us":
+			if us, err := strconv.ParseFloat(v, 64); err == nil {
+				pos = us / 1e6
+			}
+		case "speed":
+			speed, _ = strconv.ParseFloat(strings.TrimSuffix(strings.TrimSpace(v), "x"), 64)
+		case "progress":
+			line := fmt.Sprintf("▶ %s encoded", fmtSec(pos))
+			if durSec > 0 {
+				line = fmt.Sprintf("▶ %3.0f%%", min(pos/durSec, 1)*100)
+				if left := durSec - pos; speed > 0 && left/speed >= 0.5 {
+					line += fmt.Sprintf("  ~%s left", fmtSec(left/speed))
+				}
+			}
+			if speed > 0 {
+				line += fmt.Sprintf("  (%.1fx)", speed)
+			}
+			fmt.Printf("\r%-40s", line)
+			shown = true
+		}
+	}
+	if shown {
+		fmt.Println()
+	}
+}
+
+func fmtSec(s float64) string {
+	return (time.Duration(s * float64(time.Second))).Round(time.Second).String()
 }
 
 // decision is plan()'s verdict: which streams to use and how little work each
 // needs. The zero value (ok=false) means "probe failed, assume the worst".
 type decision struct {
 	ok           bool
-	vIdx, aIdx   int    // absolute stream indices; aIdx < 0 → no audio
-	vCopy, aCopy bool   // stream already fits the target → plain copy
-	isMP4        bool   // container is already mp4/mov
-	aName        string // audio codec name, for messages
-	why          string // short reason when the video needs a transcode
+	vIdx, aIdx   int     // absolute stream indices; aIdx < 0 → no audio
+	vCopy, aCopy bool    // stream already fits the target → plain copy
+	isMP4        bool    // container is already mp4/mov
+	aName        string  // audio codec name, for messages
+	why          string  // short reason when the video needs a transcode
+	durSec       float64 // input duration in seconds; 0 if unknown
 }
 
 // plan probes the input with ffprobe and decides, per stream, whether a copy
@@ -225,13 +278,15 @@ func plan(in string) decision {
 		abr, _ = strconv.Atoi(p.Streams[ai].BitRate)
 	}
 
+	d.durSec, _ = strconv.ParseFloat(p.Format.Duration, 64)
+
 	// Overall bitrate; derive it from size/duration when the container doesn't
 	// carry one. Re-encoded audio swaps its weight for the AAC target.
 	overall, _ := strconv.Atoi(p.Format.BitRate)
 	if overall <= 0 {
 		size, _ := strconv.Atoi(p.Format.Size)
-		if dur, _ := strconv.ParseFloat(p.Format.Duration, 64); dur > 0 && size > 0 {
-			overall = int(float64(size) * 8 / dur)
+		if d.durSec > 0 && size > 0 {
+			overall = int(float64(size) * 8 / d.durSec)
 		}
 	}
 	projected := overall
