@@ -90,6 +90,9 @@ func transcode(in, br string) string {
 	}
 
 	fmt.Printf("▶ Fitting %q at %s (1080p / H.264 High / AAC) → %s\n", in, br, filepath.Base(out))
+	// Encode to a .part file and rename on success, so an interrupted/failed
+	// run never leaves a half-encoded <name>-ready.mp4 for the cache to reuse.
+	tmp := out + ".part"
 	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
 		"-y", "-i", in,
 		"-map", "0:v:0", "-map", "0:a:0",
@@ -97,10 +100,16 @@ func transcode(in, br string) string {
 		"-c:v", "h264_videotoolbox", "-profile:v", "high",
 		"-b:v", br, "-maxrate", br, "-bufsize", bufsize(br),
 		"-c:a", "aac", "-b:a", "160k", "-ac", "2",
-		"-movflags", "+faststart", out)
+		"-movflags", "+faststart", "-f", "mp4", tmp)
 	cmd.Stderr = os.Stderr // ffmpeg is quiet now; only real errors reach here
 	if err := cmd.Run(); err != nil {
+		os.Remove(tmp)
 		fmt.Fprintln(os.Stderr, "ffmpeg failed:", err)
+		os.Exit(1)
+	}
+	if err := os.Rename(tmp, out); err != nil {
+		os.Remove(tmp)
+		fmt.Fprintln(os.Stderr, "rename failed:", err)
 		os.Exit(1)
 	}
 	return out
