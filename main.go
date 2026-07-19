@@ -1,8 +1,8 @@
-// serve-one: serve ONE video file over HTTP (with Range), and advertise it as a
-// minimal UPnP/DLNA MediaServer so VLC's "Local Network" browser discovers it.
-// No external daemon, stdlib only.
+// project: fit ONE video file for the projector, serve it over HTTP (with
+// Range), and advertise it as a minimal UPnP/DLNA MediaServer so VLC's
+// "Local Network" browser discovers it. No external daemon, stdlib only.
 //
-// usage: serve-one <file> [port]
+// usage: project <file>
 package main
 
 import (
@@ -25,6 +25,8 @@ const uuid = "uuid:6f3a2b10-0000-4a00-8000-project0dlna1" // stable across runs
 // much more than ~6 Mbps. A file already within these limits is copied, not re-encoded.
 const (
 	targetBitrate = "6M"      // video bitrate when a full transcode is needed
+	targetBufsize = "12M"     // decoder buffer: 2× targetBitrate
+	audioBitrate  = 256_000   // bits/s; AAC target when audio is re-encoded
 	maxOverall    = 6_500_000 // bits/s; inputs at/under this are considered "fits"
 	maxWidth      = 1920
 	maxHeight     = 1080
@@ -72,40 +74,51 @@ func main() {
 	}
 }
 
-// fit produces a projector-ready <name>-ready.mp4 next to the input, doing the
-// least work needed: probe first, then copy / re-encode-audio-only / full transcode.
-// Output always ends up faststart MP4 (H.264 + AAC), served with seek support.
+// fit returns a projector-ready file for the input, doing the least work
+// needed: probe first, then serve as-is / remux / re-encode audio / transcode.
+// Anything encoded lands in <name>-ready.mp4 next to the input (faststart MP4,
+// H.264 + AAC); an input that already fits in an mp4 container is served as-is.
 func fit(in string) string {
 	out := filepath.Join(filepath.Dir(in), baseName(in)+"-ready.mp4")
 
-	// Reuse an existing -ready.mp4 if it's newer than the source.
+	// Reuse an existing -ready.mp4 if it's newer than the source — but probe it
+	// first, so leftovers from older versions of this tool (which allowed other
+	// bitrates) can't smuggle an unfit file past the fixed target.
 	if o, err := os.Stat(out); err == nil {
 		if i, err2 := os.Stat(in); err2 == nil && o.ModTime().After(i.ModTime()) {
-			fmt.Printf("▶ Reusing %s (delete it to force a re-encode)\n", filepath.Base(out))
-			return out
+			if isFit(plan(out)) {
+				fmt.Printf("▶ Reusing %s (delete it to force a re-encode)\n", filepath.Base(out))
+				return out
+			}
+			fmt.Printf("▶ Existing %s doesn't fit the current target — redoing it\n", filepath.Base(out))
 		}
 	}
 
-	m, why := plan(in)
-	switch m {
-	case modeCopy:
-		fmt.Printf("▶ Already fit — remuxing (lossless) → %s\n", filepath.Base(out))
-	case modeAudio:
-		fmt.Printf("▶ Video is fine — re-encoding audio only (%s) → %s\n", why, filepath.Base(out))
+	d := plan(in)
+	if isFit(d) {
+		fmt.Printf("▶ Already fit — serving %s as-is\n", filepath.Base(in))
+		return in
+	}
+	switch {
+	case !d.ok || !d.vCopy:
+		fmt.Printf("▶ Transcoding (%s) → %s\n", d.why, filepath.Base(out))
+	case d.aIdx >= 0 && !d.aCopy:
+		fmt.Printf("▶ Video is fine — re-encoding audio only (audio %s) → %s\n", d.aName, filepath.Base(out))
 	default:
-		fmt.Printf("▶ Transcoding (%s) → %s\n", why, filepath.Base(out))
+		fmt.Printf("▶ Already fit — remuxing (lossless) → %s\n", filepath.Base(out))
 	}
 
 	// Encode to a .part file and rename on success, so an interrupted/failed run
 	// never leaves a half-encoded <name>-ready.mp4 for the cache to reuse.
 	tmp := out + ".part"
-	argv := append([]string{"-hide_banner", "-loglevel", "error", "-nostats",
-		"-y", "-i", in, "-map", "0:v:0", "-map", "0:a:0"}, codecArgs(m)...)
-	argv = append(argv, "-movflags", "+faststart", "-f", "mp4", tmp)
-
-	cmd := exec.Command("ffmpeg", argv...)
-	cmd.Stderr = os.Stderr // ffmpeg is quiet now; only real errors reach here
-	if err := cmd.Run(); err != nil {
+	err := ffmpeg(in, tmp, codecArgs(d))
+	if err != nil && d.ok && (d.vCopy || d.aCopy) {
+		// Streams that look fit can still refuse to copy into mp4 (bad
+		// timestamps, packed bitstreams); re-encoding regenerates them.
+		fmt.Fprintln(os.Stderr, "▶ Copy failed — retrying as a full transcode")
+		err = ffmpeg(in, tmp, codecArgs(decision{ok: true, vIdx: d.vIdx, aIdx: d.aIdx}))
+	}
+	if err != nil {
 		os.Remove(tmp)
 		fmt.Fprintln(os.Stderr, "ffmpeg failed:", err)
 		os.Exit(1)
@@ -118,86 +131,161 @@ func fit(in string) string {
 	return out
 }
 
-type mode int
+// isFit reports whether a probed file can be served without running ffmpeg at
+// all: already an mp4 whose video (and audio, if any) would be plain copies.
+func isFit(d decision) bool {
+	return d.ok && d.isMP4 && d.vCopy && (d.aIdx < 0 || d.aCopy)
+}
 
-const (
-	modeCopy  mode = iota // stream copy (already fit); just remux to faststart mp4
-	modeAudio             // copy video, re-encode audio to AAC
-	modeFull              // re-encode video + audio down to the fit profile
-)
+func ffmpeg(in, tmp string, codec []string) error {
+	argv := append([]string{"-hide_banner", "-loglevel", "error", "-nostats",
+		"-y", "-i", in}, codec...)
+	argv = append(argv, "-movflags", "+faststart", "-f", "mp4", tmp)
+	cmd := exec.Command("ffmpeg", argv...)
+	cmd.Stderr = os.Stderr // ffmpeg is quiet now; only real errors reach here
+	return cmd.Run()
+}
 
-// plan probes the input with ffprobe and picks the cheapest mode. On any probe
-// failure it falls back to a full transcode (safe default). Returns a short
-// reason string for the non-copy modes.
-func plan(in string) (mode, string) {
+// decision is plan()'s verdict: which streams to use and how little work each
+// needs. The zero value (ok=false) means "probe failed, assume the worst".
+type decision struct {
+	ok           bool
+	vIdx, aIdx   int    // absolute stream indices; aIdx < 0 → no audio
+	vCopy, aCopy bool   // stream already fits the target → plain copy
+	isMP4        bool   // container is already mp4/mov
+	aName        string // audio codec name, for messages
+	why          string // short reason when the video needs a transcode
+}
+
+// plan probes the input with ffprobe and decides, per stream, whether a copy
+// suffices. Video fits if it's 8-bit 4:2:0 h264 within 1080p and the projected
+// output bitrate stays under maxOverall; audio fits if it's already aac. Any
+// probe failure falls back to a full transcode (safe default).
+func plan(in string) decision {
+	d := decision{aIdx: -1}
 	out, err := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json",
 		"-show_format", "-show_streams", in).Output()
 	if err != nil {
-		return modeFull, "probe failed"
+		d.why = "probe failed"
+		return d
 	}
 	var p struct {
 		Streams []struct {
-			CodecType string `json:"codec_type"`
-			CodecName string `json:"codec_name"`
-			Width     int    `json:"width"`
-			Height    int    `json:"height"`
+			Index       int    `json:"index"`
+			CodecType   string `json:"codec_type"`
+			CodecName   string `json:"codec_name"`
+			PixFmt      string `json:"pix_fmt"`
+			Width       int    `json:"width"`
+			Height      int    `json:"height"`
+			BitRate     string `json:"bit_rate"`
+			MaxBitRate  string `json:"max_bit_rate"`
+			Disposition struct {
+				AttachedPic int `json:"attached_pic"`
+			} `json:"disposition"`
 		} `json:"streams"`
 		Format struct {
-			BitRate string `json:"bit_rate"`
+			FormatName string `json:"format_name"`
+			BitRate    string `json:"bit_rate"`
+			Size       string `json:"size"`
+			Duration   string `json:"duration"`
 		} `json:"format"`
 	}
 	if json.Unmarshal(out, &p) != nil {
-		return modeFull, "unreadable metadata"
+		d.why = "unreadable metadata"
+		return d
 	}
 
-	var vCodec, aCodec string
-	var w, h int
-	for _, s := range p.Streams {
-		if s.CodecType == "video" && vCodec == "" {
-			vCodec, w, h = s.CodecName, s.Width, s.Height
+	// Pick the real video stream — cover art is also codec_type "video", and
+	// ffmpeg's 0:v:N counts it too, so streams are mapped by absolute index.
+	vi, ai := -1, -1
+	for i, s := range p.Streams {
+		if s.CodecType == "video" && s.Disposition.AttachedPic == 0 && vi < 0 {
+			vi = i
 		}
-		if s.CodecType == "audio" && aCodec == "" {
-			aCodec = s.CodecName
+		if s.CodecType == "audio" && ai < 0 {
+			ai = i
 		}
 	}
-	br, _ := strconv.Atoi(p.Format.BitRate)
+	if vi < 0 {
+		d.why = "no video stream"
+		return d
+	}
+	v := p.Streams[vi]
+	d.ok, d.vIdx = true, v.Index
+	d.isMP4 = strings.Contains(p.Format.FormatName, "mp4")
+
+	abr := 0
+	if ai >= 0 {
+		d.aIdx = p.Streams[ai].Index
+		d.aName = p.Streams[ai].CodecName
+		d.aCopy = d.aName == "aac"
+		abr, _ = strconv.Atoi(p.Streams[ai].BitRate)
+	}
+
+	// Overall bitrate; derive it from size/duration when the container doesn't
+	// carry one. Re-encoded audio swaps its weight for the AAC target.
+	overall, _ := strconv.Atoi(p.Format.BitRate)
+	if overall <= 0 {
+		size, _ := strconv.Atoi(p.Format.Size)
+		if dur, _ := strconv.ParseFloat(p.Format.Duration, 64); dur > 0 && size > 0 {
+			overall = int(float64(size) * 8 / dur)
+		}
+	}
+	projected := overall
+	if ai >= 0 && !d.aCopy && abr > 0 {
+		projected = overall - abr + audioBitrate
+	}
+	peak, _ := strconv.Atoi(v.MaxBitRate)
 
 	switch {
-	case vCodec != "h264" || w > maxWidth || h > maxHeight:
-		return modeFull, fmt.Sprintf("%s %dx%d", vCodec, w, h)
-	case br <= 0 || br > maxOverall:
-		return modeFull, fmt.Sprintf("%d kbps", br/1000)
-	case aCodec != "aac":
-		return modeAudio, "audio "+aCodec
+	case v.CodecName != "h264" || v.PixFmt != "yuv420p":
+		d.why = strings.TrimSpace(v.CodecName + " " + v.PixFmt)
+	case v.Width > maxWidth || v.Height > maxHeight:
+		d.why = fmt.Sprintf("%dx%d", v.Width, v.Height)
+	case projected <= 0:
+		d.why = "unknown bitrate"
+	case projected > maxOverall:
+		d.why = fmt.Sprintf("%d kbps", projected/1000)
+	case peak > 2*maxOverall:
+		d.why = fmt.Sprintf("%d kbps peaks", peak/1000)
 	default:
-		return modeCopy, ""
+		d.vCopy = true
 	}
+	return d
 }
 
-// codecArgs returns the ffmpeg codec flags for a given mode.
-func codecArgs(m mode) []string {
-	switch m {
-	case modeCopy:
-		return []string{"-c", "copy"}
-	case modeAudio:
-		return []string{"-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-ac", "2"}
-	default: // modeFull
-		return []string{
-			"-vf", "scale='min(1920,iw)':-2",
-			"-c:v", "h264_videotoolbox", "-profile:v", "high",
-			"-b:v", targetBitrate, "-maxrate", targetBitrate, "-bufsize", bufsize(targetBitrate),
-			"-c:a", "aac", "-b:a", "160k", "-ac", "2",
+// aac_at is Apple's AudioToolbox encoder — better than ffmpeg's built-in aac
+// at the same bitrate, and always present in macOS ffmpeg builds.
+var audioArgs = []string{"-c:a", "aac_at", "-b:a", strconv.Itoa(audioBitrate), "-ac", "2"}
+
+// codecArgs returns the ffmpeg stream-selection and codec flags for a decision.
+func codecArgs(d decision) []string {
+	full := []string{
+		"-vf", fmt.Sprintf("scale=w='min(%d,iw)':h='min(%d,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+			maxWidth, maxHeight),
+		"-c:v", "h264_videotoolbox", "-profile:v", "high",
+		"-b:v", targetBitrate, "-maxrate", targetBitrate, "-bufsize", targetBufsize,
+	}
+	if !d.ok { // probe failed: transcode whatever streams are there
+		return append(append([]string{"-map", "0:v:0", "-map", "0:a:0?"}, full...), audioArgs...)
+	}
+	args := []string{"-map", fmt.Sprintf("0:%d", d.vIdx)}
+	if d.aIdx >= 0 {
+		args = append(args, "-map", fmt.Sprintf("0:%d", d.aIdx))
+	}
+	if d.vCopy {
+		args = append(args, "-c:v", "copy")
+	} else {
+		args = append(args, full...)
+	}
+	if d.aIdx >= 0 {
+		if d.aCopy {
+			args = append(args, "-c:a", "copy")
+		} else {
+			args = append(args, audioArgs...)
 		}
 	}
-}
-
-// bufsize returns 2× the bitrate (e.g. "6M" -> "12M"), leaving it unchanged
-// if it isn't in the simple "<n>M" form.
-func bufsize(br string) string {
-	if n, err := strconv.Atoi(strings.TrimSuffix(br, "M")); err == nil && strings.HasSuffix(br, "M") {
-		return strconv.Itoa(n*2) + "M"
-	}
-	return br
+	return args
 }
 
 func baseName(p string) string {
@@ -372,7 +460,7 @@ func videoItem() string {
 
 var escaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
 
-func esc(s string) string  { return escaper.Replace(s) }
+func esc(s string) string { return escaper.Replace(s) }
 func match(re *regexp.Regexp, s string) string {
 	if m := re.FindStringSubmatch(s); m != nil {
 		return strings.TrimSpace(m[1])

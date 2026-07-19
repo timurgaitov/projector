@@ -6,10 +6,10 @@ Personal Go tool: stream a local video from the Mac to a Wanbo Mozart 1 Pro proj
 ## Build / run
 - `go build -o ~/.local/bin/project .` — build to PATH (module name is `project`; go.mod required)
 - `project <file>` — the only command; no flags. Probes, does the least work, serves at http://<mac-ip>:1111/
-- Output `<name>-ready.mp4` beside the source (atomic: encodes to `.part`, renames on success); reused if newer than source (delete to force re-encode)
+- Output `<name>-ready.mp4` beside the source (atomic: encodes to `.part`, renames on success); reused if newer than source *and* it still probes as fit (delete to force re-encode). An input that's already a fit mp4 is served as-is — no ffmpeg run, no output file.
 
 ## Architecture (main.go)
-- `plan()` ffprobe's the input, then picks the cheapest ffmpeg mode: **copy** (already h264 ≤1080p ≤6.5Mbps + aac → lossless remux), **audio-only** (copy video, re-encode audio to aac), or **full** (re-encode video+audio via `h264_videotoolbox` to 6M / 1080p / H.264 High). Probe failure → full transcode. All outputs are faststart MP4.
+- `plan()` ffprobe's the input and decides per stream: video is "fit" if 8-bit 4:2:0 h264 ≤1080p with projected bitrate ≤6.5Mbps (derived from size×8/duration when the container omits bit_rate; re-encoded audio's weight is swapped for the 256k AAC target), audio is fit if aac. Fit streams are copied, unfit ones re-encoded (`h264_videotoolbox` 6M, scaled into a 1920x1080 box). Streams are mapped by absolute index — skips attached_pic cover art; audio-less inputs work. Copy failures (bad timestamps etc.) retry as a full transcode; probe failure → full transcode. All encoded outputs are faststart MP4.
 - Serve: `http.ServeContent` (streams from disk, Range/206 seek); the one file answers at any path incl. `/`
 - Discover: minimal UPnP/DLNA MediaServer — SSDP (answers M-SEARCH) + ContentDirectory SOAP; shows in VLC → Local Network as "project (Mac)"
 
