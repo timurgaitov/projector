@@ -86,17 +86,11 @@ func main() {
 func fit(in string) string {
 	out := filepath.Join(filepath.Dir(in), baseName(in)+"-ready.mp4")
 
-	// Reuse an existing -ready.mp4 if it's newer than the source — but probe it
-	// first, so leftovers from older versions of this tool (which allowed other
-	// bitrates) can't smuggle an unfit file past the fixed target.
-	if o, err := os.Stat(out); err == nil {
-		if i, err2 := os.Stat(in); err2 == nil && o.ModTime().After(i.ModTime()) {
-			if isFit(plan(out)) {
-				fmt.Printf("▶ Reusing %s (delete it to force a re-encode)\n", filepath.Base(out))
-				return out
-			}
-			fmt.Printf("▶ Existing %s doesn't fit the current target — redoing it\n", filepath.Base(out))
-		}
+	// An existing -ready.mp4 is trusted as-is — stale or off-target leftovers
+	// are the user's to delete.
+	if _, err := os.Stat(out); err == nil {
+		fmt.Printf("▶ Reusing %s (delete it to force a re-encode)\n", filepath.Base(out))
+		return out
 	}
 
 	d := plan(in)
@@ -215,8 +209,9 @@ type decision struct {
 
 // plan probes the input with ffprobe and decides, per stream, whether a copy
 // suffices. Video fits if it's 8-bit 4:2:0 h264 within 1080p and the projected
-// output bitrate stays under maxOverall; audio fits if it's already aac. Any
-// probe failure falls back to a full transcode (safe default).
+// output bitrate stays under maxOverall — both the average and the measured
+// 1-second peak (a full-file packet scan). Audio fits if it's already aac.
+// Any probe failure falls back to a full transcode (safe default).
 func plan(in string) decision {
 	d := decision{aIdx: -1}
 	out, err := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json",
@@ -234,7 +229,6 @@ func plan(in string) decision {
 			Width       int    `json:"width"`
 			Height      int    `json:"height"`
 			BitRate     string `json:"bit_rate"`
-			MaxBitRate  string `json:"max_bit_rate"`
 			Disposition struct {
 				AttachedPic int `json:"attached_pic"`
 			} `json:"disposition"`
@@ -293,8 +287,6 @@ func plan(in string) decision {
 	if ai >= 0 && !d.aCopy && abr > 0 {
 		projected = overall - abr + audioBitrate
 	}
-	peak, _ := strconv.Atoi(v.MaxBitRate)
-
 	switch {
 	case v.CodecName != "h264" || v.PixFmt != "yuv420p":
 		d.why = strings.TrimSpace(v.CodecName + " " + v.PixFmt)
@@ -304,12 +296,64 @@ func plan(in string) decision {
 		d.why = "unknown bitrate"
 	case projected > maxOverall:
 		d.why = fmt.Sprintf("%d kbps", projected/1000)
-	case peak > 2*maxOverall:
-		d.why = fmt.Sprintf("%d kbps peaks", peak/1000)
 	default:
 		d.vCopy = true
 	}
+
+	// Averages hide scene bursts that outrun the link, and containers rarely
+	// declare a trustworthy max — so measure it: worst 1-second window over
+	// the whole video stream. Only worth it when a copy is on the table.
+	if d.vCopy {
+		switch peak := peakBitrate(in, v.Index, d.durSec); {
+		case peak <= 0:
+			d.vCopy, d.why = false, "peak scan failed"
+		case peak > maxOverall:
+			d.vCopy, d.why = false, fmt.Sprintf("%d kbps peak", peak/1000)
+		}
+	}
 	return d
+}
+
+// peakBitrate returns the video stream's worst 1-second bitrate (bits/s),
+// found by bucketing every packet's size into its pts second. Reads the whole
+// file (no decoding) — minutes-long inputs take tens of seconds, hence the
+// progress line. Returns 0 when the scan fails.
+func peakBitrate(in string, idx int, durSec float64) int {
+	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", strconv.Itoa(idx),
+		"-show_entries", "packet=pts_time,size", "-of", "csv=p=0", in)
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return 0
+	}
+	if err := cmd.Start(); err != nil {
+		return 0
+	}
+	perSec := map[int]int{}
+	last := -60.0
+	sc := bufio.NewScanner(out)
+	for sc.Scan() {
+		ptsStr, sizeStr, _ := strings.Cut(sc.Text(), ",")
+		pts, err1 := strconv.ParseFloat(ptsStr, 64)
+		size, err2 := strconv.Atoi(sizeStr)
+		if err1 != nil || err2 != nil { // e.g. pts_time=N/A
+			continue
+		}
+		perSec[int(pts)] += size
+		if durSec > 0 && pts >= last+60 { // redraw once per minute of video
+			fmt.Printf("\r▶ Measuring peak bitrate… %3.0f%%", min(pts/durSec, 1)*100)
+			last = pts
+		}
+	}
+	if cmd.Wait() != nil {
+		fmt.Println()
+		return 0
+	}
+	peak := 0
+	for _, b := range perSec {
+		peak = max(peak, b*8)
+	}
+	fmt.Printf("\r%-40s\n", fmt.Sprintf("▶ Peak bitrate: %d kbps (1s window)", peak/1000))
+	return peak
 }
 
 // aac_at is Apple's AudioToolbox encoder — better than ffmpeg's built-in aac
