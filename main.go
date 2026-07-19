@@ -21,13 +21,15 @@ import (
 
 const uuid = "uuid:6f3a2b10-0000-4a00-8000-project0dlna1" // stable across runs
 
-// Fixed "fit" target: the projector is native 1080p and its Wi-Fi can't sustain
-// much more than ~6 Mbps. A file already within these limits is copied, not re-encoded.
+// Fixed "fit" target: the projector is native 1080p. 6M was the known-safe
+// rate over its Wi-Fi; 7M is on trial (5 GHz link). A file already within
+// these limits is copied, not re-encoded. maxOverall must stay above
+// targetBitrate + audioBitrate, or fit files would be re-encoded UP.
 const (
-	targetBitrate = "6M"      // video bitrate when a full transcode is needed
-	targetBufsize = "12M"     // decoder buffer: 2× targetBitrate
+	targetBitrate = "7M"      // video bitrate when a full transcode is needed
+	targetBufsize = "14M"     // decoder buffer: 2× targetBitrate
 	audioBitrate  = 256_000   // bits/s; AAC target when audio is re-encoded
-	maxOverall    = 6_500_000 // bits/s; inputs at/under this are considered "fits"
+	maxOverall    = 7_500_000 // bits/s; inputs at/under this are considered "fits"
 	maxWidth      = 1920
 	maxHeight     = 1080
 )
