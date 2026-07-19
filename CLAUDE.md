@@ -5,12 +5,11 @@ Personal Go tool: stream a local video from the Mac to a Wanbo Mozart 1 Pro proj
 
 ## Build / run
 - `go build -o ~/.local/bin/project .` — build to PATH (module name is `project`; go.mod required)
-- `project <file> [bitrate]` — transcode-to-fit (default 6M), serve at http://<mac-ip>:1111/
-- `project -raw <file>` — serve as-is, skip transcode
-- Output `<name>-ready.mp4` beside the source; reused if newer than source (delete to force re-encode)
+- `project <file>` — the only command; no flags. Probes, does the least work, serves at http://<mac-ip>:1111/
+- Output `<name>-ready.mp4` beside the source (atomic: encodes to `.part`, renames on success); reused if newer than source (delete to force re-encode)
 
 ## Architecture (main.go)
-- Transcode: shells to `ffmpeg` (`-hide_banner -loglevel error -nostats`, `h264_videotoolbox`, 1080p cap / H.264 High / AAC / faststart)
+- `plan()` ffprobe's the input, then picks the cheapest ffmpeg mode: **copy** (already h264 ≤1080p ≤6.5Mbps + aac → lossless remux), **audio-only** (copy video, re-encode audio to aac), or **full** (re-encode video+audio via `h264_videotoolbox` to 6M / 1080p / H.264 High). Probe failure → full transcode. All outputs are faststart MP4.
 - Serve: `http.ServeContent` (streams from disk, Range/206 seek); the one file answers at any path incl. `/`
 - Discover: minimal UPnP/DLNA MediaServer — SSDP (answers M-SEARCH) + ContentDirectory SOAP; shows in VLC → Local Network as "project (Mac)"
 

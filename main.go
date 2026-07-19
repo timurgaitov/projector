@@ -6,6 +6,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -20,6 +21,15 @@ import (
 
 const uuid = "uuid:6f3a2b10-0000-4a00-8000-project0dlna1" // stable across runs
 
+// Fixed "fit" target: the projector is native 1080p and its Wi-Fi can't sustain
+// much more than ~6 Mbps. A file already within these limits is copied, not re-encoded.
+const (
+	targetBitrate = "6M"      // video bitrate when a full transcode is needed
+	maxOverall    = 6_500_000 // bits/s; inputs at/under this are considered "fits"
+	maxWidth      = 1920
+	maxHeight     = 1080
+)
+
 var (
 	filePath string
 	title    string
@@ -28,29 +38,15 @@ var (
 )
 
 func main() {
-	// usage: project [-raw] <file> [bitrate, e.g. 8M]
-	args := os.Args[1:]
-	raw := false
-	if len(args) > 0 && (args[0] == "-raw" || args[0] == "--raw") {
-		raw, args = true, args[1:]
-	}
-	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: project [-raw] <file> [bitrate, e.g. 8M]")
+	if len(os.Args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: project <file>")
 		os.Exit(1)
 	}
-	input := args[0]
-	bitrate := "6M"
-	if len(args) > 1 {
-		bitrate = args[1]
-	}
+	input := os.Args[1]
 	port = "1111"
 	title = baseName(input)
 
-	if raw {
-		filePath = input // serve as-is, no transcode
-	} else {
-		filePath = transcode(input, bitrate)
-	}
+	filePath = fit(input)
 	fi, err := os.Stat(filePath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -76,31 +72,38 @@ func main() {
 	}
 }
 
-// transcode fits any input to a fixed projector/wifi profile (1080p cap,
-// H.264 High, AAC stereo, faststart) via ffmpeg, returning the output path.
-func transcode(in, br string) string {
+// fit produces a projector-ready <name>-ready.mp4 next to the input, doing the
+// least work needed: probe first, then copy / re-encode-audio-only / full transcode.
+// Output always ends up faststart MP4 (H.264 + AAC), served with seek support.
+func fit(in string) string {
 	out := filepath.Join(filepath.Dir(in), baseName(in)+"-ready.mp4")
 
-	// Reuse an existing -ready.mp4 if it's newer than the source (skip re-encode).
+	// Reuse an existing -ready.mp4 if it's newer than the source.
 	if o, err := os.Stat(out); err == nil {
 		if i, err2 := os.Stat(in); err2 == nil && o.ModTime().After(i.ModTime()) {
-			fmt.Printf("▶ Reusing %s (already fit — delete it to force re-encode)\n", filepath.Base(out))
+			fmt.Printf("▶ Reusing %s (delete it to force a re-encode)\n", filepath.Base(out))
 			return out
 		}
 	}
 
-	fmt.Printf("▶ Fitting %q at %s (1080p / H.264 High / AAC) → %s\n", in, br, filepath.Base(out))
-	// Encode to a .part file and rename on success, so an interrupted/failed
-	// run never leaves a half-encoded <name>-ready.mp4 for the cache to reuse.
+	m, why := plan(in)
+	switch m {
+	case modeCopy:
+		fmt.Printf("▶ Already fit — remuxing (lossless) → %s\n", filepath.Base(out))
+	case modeAudio:
+		fmt.Printf("▶ Video is fine — re-encoding audio only (%s) → %s\n", why, filepath.Base(out))
+	default:
+		fmt.Printf("▶ Transcoding (%s) → %s\n", why, filepath.Base(out))
+	}
+
+	// Encode to a .part file and rename on success, so an interrupted/failed run
+	// never leaves a half-encoded <name>-ready.mp4 for the cache to reuse.
 	tmp := out + ".part"
-	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
-		"-y", "-i", in,
-		"-map", "0:v:0", "-map", "0:a:0",
-		"-vf", "scale='min(1920,iw)':-2",
-		"-c:v", "h264_videotoolbox", "-profile:v", "high",
-		"-b:v", br, "-maxrate", br, "-bufsize", bufsize(br),
-		"-c:a", "aac", "-b:a", "160k", "-ac", "2",
-		"-movflags", "+faststart", "-f", "mp4", tmp)
+	argv := append([]string{"-hide_banner", "-loglevel", "error", "-nostats",
+		"-y", "-i", in, "-map", "0:v:0", "-map", "0:a:0"}, codecArgs(m)...)
+	argv = append(argv, "-movflags", "+faststart", "-f", "mp4", tmp)
+
+	cmd := exec.Command("ffmpeg", argv...)
 	cmd.Stderr = os.Stderr // ffmpeg is quiet now; only real errors reach here
 	if err := cmd.Run(); err != nil {
 		os.Remove(tmp)
@@ -113,6 +116,79 @@ func transcode(in, br string) string {
 		os.Exit(1)
 	}
 	return out
+}
+
+type mode int
+
+const (
+	modeCopy  mode = iota // stream copy (already fit); just remux to faststart mp4
+	modeAudio             // copy video, re-encode audio to AAC
+	modeFull              // re-encode video + audio down to the fit profile
+)
+
+// plan probes the input with ffprobe and picks the cheapest mode. On any probe
+// failure it falls back to a full transcode (safe default). Returns a short
+// reason string for the non-copy modes.
+func plan(in string) (mode, string) {
+	out, err := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json",
+		"-show_format", "-show_streams", in).Output()
+	if err != nil {
+		return modeFull, "probe failed"
+	}
+	var p struct {
+		Streams []struct {
+			CodecType string `json:"codec_type"`
+			CodecName string `json:"codec_name"`
+			Width     int    `json:"width"`
+			Height    int    `json:"height"`
+		} `json:"streams"`
+		Format struct {
+			BitRate string `json:"bit_rate"`
+		} `json:"format"`
+	}
+	if json.Unmarshal(out, &p) != nil {
+		return modeFull, "unreadable metadata"
+	}
+
+	var vCodec, aCodec string
+	var w, h int
+	for _, s := range p.Streams {
+		if s.CodecType == "video" && vCodec == "" {
+			vCodec, w, h = s.CodecName, s.Width, s.Height
+		}
+		if s.CodecType == "audio" && aCodec == "" {
+			aCodec = s.CodecName
+		}
+	}
+	br, _ := strconv.Atoi(p.Format.BitRate)
+
+	switch {
+	case vCodec != "h264" || w > maxWidth || h > maxHeight:
+		return modeFull, fmt.Sprintf("%s %dx%d", vCodec, w, h)
+	case br <= 0 || br > maxOverall:
+		return modeFull, fmt.Sprintf("%d kbps", br/1000)
+	case aCodec != "aac":
+		return modeAudio, "audio "+aCodec
+	default:
+		return modeCopy, ""
+	}
+}
+
+// codecArgs returns the ffmpeg codec flags for a given mode.
+func codecArgs(m mode) []string {
+	switch m {
+	case modeCopy:
+		return []string{"-c", "copy"}
+	case modeAudio:
+		return []string{"-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-ac", "2"}
+	default: // modeFull
+		return []string{
+			"-vf", "scale='min(1920,iw)':-2",
+			"-c:v", "h264_videotoolbox", "-profile:v", "high",
+			"-b:v", targetBitrate, "-maxrate", targetBitrate, "-bufsize", bufsize(targetBitrate),
+			"-c:a", "aac", "-b:a", "160k", "-ac", "2",
+		}
+	}
 }
 
 // bufsize returns 2× the bitrate (e.g. "6M" -> "12M"), leaving it unchanged
