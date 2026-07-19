@@ -21,17 +21,16 @@ import (
 
 const uuid = "uuid:6f3a2b10-0000-4a00-8000-project0dlna1" // stable across runs
 
-// Fixed "fit" target: the projector is native 1080p and 8M sustained is
-// proven over its 5 GHz Wi-Fi. The 12.5M copy ceiling is on trial (link
-// test): the encode target stays 8M — more buys nothing visible at 1080p —
-// but a higher ceiling lets high-bitrate sources stream untouched. maxOverall
-// must stay above targetBitrate + audioBitrate, or fit files would be
-// re-encoded UP.
+// Fixed "fit" target: the projector is native 1080p; ~11.7 Mbps sustained is
+// proven over its 5 GHz Wi-Fi (2026-07 link tests). The encode target stays
+// 8M — more buys nothing visible at 1080p — while the higher copy ceiling
+// lets high-bitrate sources stream untouched. maxOverall must stay above
+// targetBitrate + audioBitrate, or fit files would be re-encoded UP.
 const (
 	targetBitrate = "8M"       // video bitrate when a full transcode is needed
 	targetBufsize = "16M"      // decoder buffer: 2× targetBitrate
 	audioBitrate  = 256_000    // bits/s; AAC target when audio is re-encoded
-	maxOverall    = 12_500_000 // bits/s; inputs at/under this are considered "fits"
+	maxOverall    = 12_000_000 // bits/s; inputs at/under this are considered "fits"
 	maxWidth      = 1920
 	maxHeight     = 1080
 )
