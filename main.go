@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -32,6 +33,8 @@ const (
 	targetBitrate = "8M"       // video bitrate when a full transcode is needed
 	targetBufsize = "16M"      // decoder buffer: 2× targetBitrate
 	audioBitrate  = 256_000    // bits/s; AAC target when audio is re-encoded
+	targetLUFS    = -16.0      // integrated loudness target for re-encoded audio
+	maxTruePeak   = -1.5       // dB ceiling the limiter holds re-encoded audio under
 	maxOverall    = 12_000_000 // bits/s; inputs at/under this are considered "fits"
 	maxWidth      = 1920
 	maxHeight     = 1080
@@ -115,7 +118,8 @@ func fit(in string) string {
 		// Streams that look fit can still refuse to copy into mp4 (bad
 		// timestamps, packed bitstreams); re-encoding regenerates them.
 		fmt.Fprintln(os.Stderr, "▶ Copy failed — retrying as a full transcode")
-		err = ffmpeg(in, tmp, codecArgs(decision{ok: true, vIdx: d.vIdx, aIdx: d.aIdx}), d.durSec)
+		err = ffmpeg(in, tmp, codecArgs(decision{ok: true, vIdx: d.vIdx, aIdx: d.aIdx,
+			gainDB: d.gainDB, hasGain: d.hasGain}), d.durSec)
 	}
 	if err != nil {
 		os.Remove(tmp)
@@ -205,6 +209,8 @@ type decision struct {
 	aName        string  // audio codec name, for messages
 	why          string  // short reason when the video needs a transcode
 	durSec       float64 // input duration in seconds; 0 if unknown
+	gainDB       float64 // static loudness gain for re-encoded audio
+	hasGain      bool    // gainDB was actually measured
 }
 
 // plan probes the input with ffprobe and decides, per stream, whether a copy
@@ -311,6 +317,14 @@ func plan(in string) decision {
 			d.vCopy, d.why = false, fmt.Sprintf("%d kbps peak", peak/1000)
 		}
 	}
+
+	// A bare stereo downmix plays several dB quieter than the source
+	// (swresample scales the mix down to clip-proof it), so re-encoded audio
+	// gets a measured static gain toward targetLUFS — a pure volume offset,
+	// dynamics untouched.
+	if d.aIdx >= 0 && !d.aCopy {
+		d.gainDB, d.hasGain = loudnessGain(in, d.aIdx, d.durSec)
+	}
 	return d
 }
 
@@ -356,9 +370,80 @@ func peakBitrate(in string, idx int, durSec float64) int {
 	return peak
 }
 
+// downmix is the stereo conversion re-encoded audio goes through. As an
+// explicit filter (not -ac 2) so the loudness measure pass can run the exact
+// signal the encoder will hear — dialogue level shifts with the mix.
+const downmix = "aformat=channel_layouts=stereo"
+
+// loudnessGain measures the input audio's integrated loudness (EBU R128, over
+// the stereo downmix) and returns the static dB gain that brings it to
+// targetLUFS. Peaks the boost pushes over maxTruePeak are the limiter's job —
+// capping the gain by whole-file peak instead traded the entire boost for a
+// few transients (a real BDRip: −27 LUFS wanting +11 dB, but +1.8 dBTP peaks
+// turned the gain into a −3.3 dB *cut*). Decode-only full pass — a minute or
+// two for a movie. ok=false means the measurement failed; the encode then
+// runs plain, as before.
+func loudnessGain(in string, idx int, durSec float64) (gain float64, ok bool) {
+	fmt.Println("▶ Measuring loudness…")
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-nostats",
+		"-progress", "pipe:1", "-stats_period", "0.5",
+		"-i", in, "-map", fmt.Sprintf("0:%d", idx),
+		"-af", downmix+",loudnorm=print_format=json",
+		"-f", "null", os.DevNull)
+	var meas strings.Builder
+	cmd.Stderr = &meas // loudnorm prints its JSON on stderr at stream end
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return 0, false
+	}
+	if err := cmd.Start(); err != nil {
+		return 0, false
+	}
+	showProgress(out, durSec)
+	fail := func() (float64, bool) {
+		fmt.Fprintln(os.Stderr, "▶ Loudness measurement failed — encoding without gain")
+		return 0, false
+	}
+	if cmd.Wait() != nil {
+		return fail()
+	}
+	s := meas.String()
+	i := strings.LastIndex(s, "{")
+	if i < 0 {
+		return fail()
+	}
+	var m struct {
+		I  string `json:"input_i"`
+		TP string `json:"input_tp"`
+	}
+	if json.NewDecoder(strings.NewReader(s[i:])).Decode(&m) != nil {
+		return fail()
+	}
+	lufs, err1 := strconv.ParseFloat(m.I, 64)
+	tp, err2 := strconv.ParseFloat(m.TP, 64)
+	if err1 != nil || err2 != nil || lufs < -70 { // -70 ≈ silence (loudnorm prints "-inf")
+		return fail()
+	}
+	gain = targetLUFS - lufs
+	fmt.Printf("▶ Loudness %.1f LUFS (peak %+.1f dBTP) → %+.1f dB gain\n", lufs, tp, gain)
+	return gain, true
+}
+
 // aac_at is Apple's AudioToolbox encoder — better than ffmpeg's built-in aac
 // at the same bitrate, and always present in macOS ffmpeg builds.
-var audioArgs = []string{"-c:a", "aac_at", "-b:a", strconv.Itoa(audioBitrate), "-ac", "2"}
+func audioArgs(d decision) []string {
+	f := downmix
+	if d.hasGain {
+		f += fmt.Sprintf(",volume=%.2fdB", d.gainDB)
+	}
+	// Lookahead limiter tames the split-second overs (downmix channel
+	// summation, boosted transients) that would otherwise clip at the encoder;
+	// everything under the ceiling passes untouched. level=false — its default
+	// auto-level would re-normalize and undo the gain; latency=true keeps A/V
+	// sync across the lookahead delay.
+	f += fmt.Sprintf(",alimiter=limit=%.4f:level=false:latency=true", math.Pow(10, maxTruePeak/20))
+	return []string{"-c:a", "aac_at", "-b:a", strconv.Itoa(audioBitrate), "-af", f}
+}
 
 // codecArgs returns the ffmpeg stream-selection and codec flags for a decision.
 func codecArgs(d decision) []string {
@@ -369,7 +454,7 @@ func codecArgs(d decision) []string {
 		"-b:v", targetBitrate, "-maxrate", targetBitrate, "-bufsize", targetBufsize,
 	}
 	if !d.ok { // probe failed: transcode whatever streams are there
-		return append(append([]string{"-map", "0:v:0", "-map", "0:a:0?"}, full...), audioArgs...)
+		return append(append([]string{"-map", "0:v:0", "-map", "0:a:0?"}, full...), audioArgs(d)...)
 	}
 	args := []string{"-map", fmt.Sprintf("0:%d", d.vIdx)}
 	if d.aIdx >= 0 {
@@ -384,7 +469,7 @@ func codecArgs(d decision) []string {
 		if d.aCopy {
 			args = append(args, "-c:a", "copy")
 		} else {
-			args = append(args, audioArgs...)
+			args = append(args, audioArgs(d)...)
 		}
 	}
 	return args
