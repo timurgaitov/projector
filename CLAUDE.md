@@ -18,6 +18,11 @@ Personal Go tool: stream a local video from the Mac to a Wanbo Mozart 1 Pro proj
 - Run binary in background, then wait for it: `curl -s --retry-connrefused --retry 40 --retry-delay 1 -o /dev/null http://127.0.0.1:1111/`
 - SSDP: send an `M-SEARCH` UDP packet to 239.255.255.250:1900; expect a reply carrying `LOCATION`
 
+## Projector hardware (probed via adb, 2026-07)
+- Google TV side is a built-in SkyworthDigital "4K Google TV Stick": Amlogic SoC (board HP46B), Android 14, armeabi-v7a. `adb connect 192.168.1.8:5555` (wireless debugging; Mac's key authorized).
+- Hardware video decoders (vendor codec table): h264 + HEVC + VP9 + AV1, all to 4K. Verified on-device (VLC playing an HTTP stream, logcat): 1080p HEVC 8-bit *and* 10-bit both use hardware `c2.amlogic.hevc.decoder` — no software fallback, no drops. Vendor audio decoders: AC-3, E-AC-3, AC-4, DTS(-HD).
+- Implication: plan() could accept ≤1080p 4:2:0 HEVC as copy-fit (same bitrate gates, `-tag:v hvc1` in mp4) — pending a real-rip trial; synthetic clips passed.
+
 ## Gotchas
 - Link testing (2026-07): ~11.7 Mbps sustained proven over 5 GHz Wi-Fi. Stress clip = `testsrc2` + `noise=alls=N` through `h264_videotoolbox` (N≈32→7M, 33→8M, 36-37→11-12M; bitrate is content-capped, `-b:v` barely steers it). Do NOT use x264 `nal-hrd=cbr` filler streams — the projector's decoder shows one frame and quits. videotoolbox overshoots `-maxrate` up to 2-3× on complex content.
 - Real x264 BDRips burst ~2× their average: a 10.5 Mbps-avg movie hit 20.4 Mbps over a 1s window (18 Mbps sustained for 10s) and dropped frames on the projector despite passing the 12M average gate — why plan() measures the peak instead of trusting averages or (usually absent) `max_bit_rate` metadata
