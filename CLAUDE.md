@@ -17,6 +17,11 @@ Personal Go tool: stream a local video from the Mac to a Wanbo Mozart 1 Pro proj
 - Test clip: `ffmpeg -f lavfi -i testsrc=duration=2:size=1280x720:rate=25 -f lavfi -i sine=duration=2 -pix_fmt yuv420p -c:v libx264 -c:a aac out.mkv`
 - Run binary in background, then wait for it: `curl -s --retry-connrefused --retry 40 --retry-delay 1 -o /dev/null http://127.0.0.1:1111/`
 - SSDP: send an `M-SEARCH` UDP packet to 239.255.255.250:1900; expect a reply carrying `LOCATION`
+- Probing projector codec support (how HEVC hw decode was verified, 2026-07):
+  1. `adb connect 192.168.1.8:5555` (IP may drift — rediscover with `adb mdns services`; wireless debugging is enabled, Mac's key authorized). Paper answer: `getprop ro.board.platform` etc.; vendor codec tables in `/vendor/etc/media_codecs*.xml` list every hw decoder with size/rate limits (but not bit depth — test that live).
+  2. Smuggle any codec past plan(): encode the test clip straight to `x-ready.mp4` (e.g. `-c:v hevc_videotoolbox -tag:v hvc1`, add `noise=alls=20:allf=t` so it's not trivially decodable; `-pix_fmt p010le` for the 10-bit variant), `touch x.mp4`, `project x.mp4` — the -ready file is served untouched, no fit check.
+  3. Play it on the projector, no remote needed: `adb logcat -c`, then `adb shell 'am start -a android.intent.action.VIEW -d "http://<mac-ip>:1111/x.mp4" -t "video/mp4" org.videolan.vlc'`
+  4. Verdict: `adb logcat -d | grep "using c2\."` — `c2.amlogic.*` = hardware, `c2.android.*`/`OMX.google.*` = software fallback; also grep `-i drop`. Ignore `mali_gralloc` "falling back" lines (GPU allocator noise). Synthetic pass ≠ real-rip pass — confirm with real content before widening plan().
 
 ## Projector hardware (probed via adb, 2026-07)
 - Google TV side is a built-in SkyworthDigital "4K Google TV Stick": Amlogic SoC (board HP46B), Android 14, armeabi-v7a. `adb connect 192.168.1.8:5555` (wireless debugging; Mac's key authorized).
