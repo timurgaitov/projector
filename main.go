@@ -24,20 +24,21 @@ import (
 
 const uuid = "uuid:6f3a2b10-0000-4a00-8000-project0dlna1" // stable across runs
 
-// Fixed "fit" target: the projector is native 1080p; ~11.7 Mbps sustained is
-// proven over its 5 GHz Wi-Fi (2026-07 link tests). The encode target stays
-// 8M — more buys nothing visible at 1080p — but transcodes now go to HEVC
-// (same 8M buys more quality; projector hw decode verified 2026-07), while
-// the higher copy ceiling lets high-bitrate sources stream untouched.
-// maxOverall must stay above targetBitrate + audioBitrate, or fit files
-// would be re-encoded UP.
+// Fixed "fit" target: the projector is native 1080p. The 2026-07-20 ladder
+// trial (real BDRip content, logcat-verified on-device) played h264 up to
+// 60M and HEVC up to 57M 1s-peaks clean on hardware decode, with iperf3
+// showing 266 Mbps of link. The gates sit under those proven peaks with
+// margin for worse radio days; the old 12M gate traced to a VLC-pipeline
+// artifact, not the link. maxOverall must stay above targetBitrate +
+// audioBitrate, or fit files would be re-encoded UP.
 const (
-	targetBitrate = "8M"       // video bitrate when a full transcode is needed
-	targetBufsize = "16M"      // decoder buffer: 2× targetBitrate
+	targetBitrate = "12M"      // video bitrate when a full transcode is needed
+	targetBufsize = "24M"      // decoder buffer: 2× targetBitrate
 	audioBitrate  = 256_000    // bits/s; AAC target when audio is re-encoded
 	targetLUFS    = -16.0      // integrated loudness target for re-encoded audio
 	maxTruePeak   = -1.5       // dB ceiling the limiter holds re-encoded audio under
-	maxOverall    = 12_000_000 // bits/s; inputs at/under this are considered "fits"
+	maxOverall    = 40_000_000 // bits/s; inputs at/under this average are "fits"
+	maxPeak       = 50_000_000 // bits/s; worst measured 1s window a copy may carry
 	maxWidth      = 1920
 	maxHeight     = 1080
 )
@@ -242,6 +243,7 @@ func fmtSec(s float64) string {
 type decision struct {
 	ok       bool
 	vIdx     int      // absolute video stream index
+	vCodec   string   // video codec name (steers the mp4 tag when copying hevc)
 	vCopy    bool     // video already fits the target → plain copy
 	audios   []aTrack // kept audio tracks, in output order; empty → no audio
 	allAudio bool     // kept every input audio track, in file order
@@ -366,8 +368,14 @@ func plan(in string) decision {
 			projected += audioBitrate - t.br
 		}
 	}
+	// Copy-fit codecs, all hw-decode verified on-device with real content
+	// (2026-07-20 ladder): 8-bit h264, 8/10-bit HEVC. 10-bit h264 stays out —
+	// no hardware decodes Hi10P anywhere.
+	d.vCodec = v.CodecName
+	hwFit := (v.CodecName == "h264" && v.PixFmt == "yuv420p") ||
+		(v.CodecName == "hevc" && (v.PixFmt == "yuv420p" || v.PixFmt == "yuv420p10le"))
 	switch {
-	case v.CodecName != "h264" || v.PixFmt != "yuv420p":
+	case !hwFit:
 		d.why = strings.TrimSpace(v.CodecName + " " + v.PixFmt)
 	case v.Width > maxWidth || v.Height > maxHeight:
 		d.why = fmt.Sprintf("%dx%d", v.Width, v.Height)
@@ -386,7 +394,7 @@ func plan(in string) decision {
 		switch peak := peakBitrate(in, v.Index, d.durSec); {
 		case peak <= 0:
 			d.vCopy, d.why = false, "peak scan failed"
-		case peak > maxOverall:
+		case peak > maxPeak:
 			d.vCopy, d.why = false, fmt.Sprintf("%d kbps peak", peak/1000)
 		}
 	}
@@ -615,6 +623,10 @@ func codecArgs(d decision) []string {
 	}
 	if d.vCopy {
 		args = append(args, "-c:v", "copy")
+		if d.vCodec == "hevc" {
+			// copied hevc gets mp4's default hev1 tag, which players reject
+			args = append(args, "-tag:v", "hvc1")
+		}
 	} else {
 		args = append(args, full...)
 	}
