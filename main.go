@@ -26,9 +26,11 @@ const uuid = "uuid:6f3a2b10-0000-4a00-8000-project0dlna1" // stable across runs
 
 // Fixed "fit" target: the projector is native 1080p; ~11.7 Mbps sustained is
 // proven over its 5 GHz Wi-Fi (2026-07 link tests). The encode target stays
-// 8M — more buys nothing visible at 1080p — while the higher copy ceiling
-// lets high-bitrate sources stream untouched. maxOverall must stay above
-// targetBitrate + audioBitrate, or fit files would be re-encoded UP.
+// 8M — more buys nothing visible at 1080p — but transcodes now go to HEVC
+// (same 8M buys more quality; projector hw decode verified 2026-07), while
+// the higher copy ceiling lets high-bitrate sources stream untouched.
+// maxOverall must stay above targetBitrate + audioBitrate, or fit files
+// would be re-encoded UP.
 const (
 	targetBitrate = "8M"       // video bitrate when a full transcode is needed
 	targetBufsize = "16M"      // decoder buffer: 2× targetBitrate
@@ -450,7 +452,11 @@ func codecArgs(d decision) []string {
 	full := []string{
 		"-vf", fmt.Sprintf("scale=w='min(%d,iw)':h='min(%d,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
 			maxWidth, maxHeight),
-		"-c:v", "h264_videotoolbox", "-profile:v", "high",
+		// hevc_videotoolbox: better quality per bit than h264 at the same 8M;
+		// projector hw-decodes HEVC 8/10-bit (verified 2026-07). hvc1 tag —
+		// players reject mp4's default hev1. No pinned pix_fmt: 8-bit sources
+		// stay 8-bit, 10-bit sources encode as Main10 instead of being crushed.
+		"-c:v", "hevc_videotoolbox", "-tag:v", "hvc1",
 		"-b:v", targetBitrate, "-maxrate", targetBitrate, "-bufsize", targetBufsize,
 	}
 	if !d.ok { // probe failed: transcode whatever streams are there
