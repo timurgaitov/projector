@@ -180,6 +180,7 @@ func reencNames(ts []aTrack) string {
 }
 
 func ffmpeg(in, tmp string, codec []string, durSec float64) error {
+	start := time.Now()
 	argv := append([]string{"-hide_banner", "-loglevel", "error", "-nostats",
 		"-progress", "pipe:1", "-stats_period", "0.5",
 		"-y", "-i", in}, codec...)
@@ -194,7 +195,11 @@ func ffmpeg(in, tmp string, codec []string, durSec float64) error {
 		return err
 	}
 	showProgress(out, durSec)
-	return cmd.Wait()
+	err = cmd.Wait()
+	if err == nil {
+		fmt.Printf("▶ Done in %s\n", took(start))
+	}
+	return err
 }
 
 // showProgress renders ffmpeg's -progress key=value feed as one line updated
@@ -236,6 +241,15 @@ func showProgress(r io.Reader, durSec float64) {
 
 func fmtSec(s float64) string {
 	return (time.Duration(s * float64(time.Second))).Round(time.Second).String()
+}
+
+// took formats a step's elapsed wall time for log lines.
+func took(start time.Time) string {
+	d := time.Since(start)
+	if d < time.Second {
+		return d.Round(10 * time.Millisecond).String()
+	}
+	return d.Round(time.Second).String()
 }
 
 // decision is plan()'s verdict: which streams to use and how little work each
@@ -489,6 +503,7 @@ func (t aTrack) describe() string {
 // file (no decoding) — minutes-long inputs take tens of seconds, hence the
 // progress line. Returns 0 when the scan fails.
 func peakBitrate(in string, idx int, durSec float64) int {
+	start := time.Now()
 	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", strconv.Itoa(idx),
 		"-show_entries", "packet=pts_time,size", "-of", "csv=p=0", in)
 	out, err := cmd.StdoutPipe()
@@ -522,7 +537,7 @@ func peakBitrate(in string, idx int, durSec float64) int {
 	for _, b := range perSec {
 		peak = max(peak, b*8)
 	}
-	fmt.Printf("\r%-40s\n", fmt.Sprintf("▶ Peak bitrate: %d kbps (1s window)", peak/1000))
+	fmt.Printf("\r%-40s\n", fmt.Sprintf("▶ Peak bitrate: %d kbps (1s window) — took %s", peak/1000, took(start)))
 	return peak
 }
 
@@ -541,6 +556,7 @@ const downmix = "aformat=channel_layouts=stereo"
 // runs plain, as before.
 func loudnessGain(in string, idx int, durSec float64, desc string) (gain float64, ok bool) {
 	fmt.Printf("▶ Measuring loudness%s…\n", desc)
+	start := time.Now()
 	cmd := exec.Command("ffmpeg", "-hide_banner", "-nostats",
 		"-progress", "pipe:1", "-stats_period", "0.5",
 		"-i", in, "-map", fmt.Sprintf("0:%d", idx),
@@ -581,7 +597,7 @@ func loudnessGain(in string, idx int, durSec float64, desc string) (gain float64
 		return fail()
 	}
 	gain = targetLUFS - lufs
-	fmt.Printf("▶ Loudness %.1f LUFS (peak %+.1f dBTP) → %+.1f dB gain\n", lufs, tp, gain)
+	fmt.Printf("▶ Loudness %.1f LUFS (peak %+.1f dBTP) → %+.1f dB gain — took %s\n", lufs, tp, gain, took(start))
 	return gain, true
 }
 
