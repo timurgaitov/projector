@@ -585,18 +585,23 @@ const downmix = "aformat=channel_layouts=stereo"
 // targetLUFS. Peaks the boost pushes over maxTruePeak are the limiter's job —
 // capping the gain by whole-file peak instead traded the entire boost for a
 // few transients (a real BDRip: −27 LUFS wanting +11 dB, but +1.8 dBTP peaks
-// turned the gain into a −3.3 dB *cut*). Decode-only full pass — a minute or
-// two for a movie. ok=false means the measurement failed; the encode then
+// turned the gain into a −3.3 dB *cut*). Decode-bound full pass — tens of
+// seconds for a movie. ok=false means the measurement failed; the encode then
 // runs plain, as before.
 func loudnessGain(in string, idx, slot int, st *loudnessStatus, desc string) (gain float64, ok bool) {
 	start := time.Now()
 	cmd := exec.Command("ffmpeg", "-hide_banner", "-nostats",
 		"-progress", "pipe:1", "-stats_period", "0.5",
 		"-i", in, "-map", fmt.Sprintf("0:%d", idx),
-		"-af", downmix+",loudnorm=print_format=json",
+		// ebur128, not loudnorm-in-measure-mode: same integrated LUFS, but
+		// ~30x faster (loudnorm resamples everything to 192 kHz internally).
+		// framelog=verbose keeps the per-100ms lines off stderr; sample peak
+		// (log-only — see the whole-file-peak note above) is free, true peak
+		// would cost 4x oversampling.
+		"-af", downmix+",ebur128=framelog=verbose:peak=sample",
 		"-f", "null", os.DevNull)
 	var meas strings.Builder
-	cmd.Stderr = &meas // loudnorm prints its JSON on stderr at stream end
+	cmd.Stderr = &meas // ebur128 prints its summary on stderr at stream end
 	fail := func() (float64, bool) {
 		st.finish(slot, os.Stderr, "▶ Loudness measurement"+desc+" failed — encoding without gain")
 		return 0, false
@@ -612,26 +617,21 @@ func loudnessGain(in string, idx, slot int, st *loudnessStatus, desc string) (ga
 	if cmd.Wait() != nil {
 		return fail()
 	}
-	s := meas.String()
-	i := strings.LastIndex(s, "{")
-	if i < 0 {
-		return fail()
+	lufs, peakDB := math.NaN(), math.NaN()
+	for ln := range strings.SplitSeq(meas.String(), "\n") {
+		switch f := strings.Fields(ln); {
+		case len(f) == 3 && f[0] == "I:" && f[2] == "LUFS":
+			lufs, _ = strconv.ParseFloat(f[1], 64)
+		case len(f) == 3 && f[0] == "Peak:" && f[2] == "dBFS":
+			peakDB, _ = strconv.ParseFloat(f[1], 64)
+		}
 	}
-	var m struct {
-		I  string `json:"input_i"`
-		TP string `json:"input_tp"`
-	}
-	if json.NewDecoder(strings.NewReader(s[i:])).Decode(&m) != nil {
-		return fail()
-	}
-	lufs, err1 := strconv.ParseFloat(m.I, 64)
-	tp, err2 := strconv.ParseFloat(m.TP, 64)
-	if err1 != nil || err2 != nil || lufs < -70 { // -70 ≈ silence (loudnorm prints "-inf")
+	if math.IsNaN(lufs) || lufs <= -70 { // -70 = ebur128's silence floor
 		return fail()
 	}
 	gain = targetLUFS - lufs
-	st.finish(slot, os.Stdout, fmt.Sprintf("▶ Loudness%s %.1f LUFS (peak %+.1f dBTP) → %+.1f dB gain — took %s",
-		desc, lufs, tp, gain, took(start)))
+	st.finish(slot, os.Stdout, fmt.Sprintf("▶ Loudness%s %.1f LUFS (peak %+.1f dBFS) → %+.1f dB gain — took %s",
+		desc, lufs, peakDB, gain, took(start)))
 	return gain, true
 }
 
