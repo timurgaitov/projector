@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -207,8 +208,30 @@ func ffmpeg(in, tmp string, codec []string, durSec float64) error {
 // position and encode speed. Values within a block arrive in a fixed order
 // ending with "progress=", so that key triggers the redraw.
 func showProgress(r io.Reader, durSec float64) {
-	var pos, speed float64 // seconds encoded; encode speed vs realtime
 	shown := false
+	parseProgress(r, func(pos, speed float64) {
+		line := fmt.Sprintf("▶ %s encoded", fmtSec(pos))
+		if durSec > 0 {
+			line = fmt.Sprintf("▶ %3.0f%%", min(pos/durSec, 1)*100)
+			if left := durSec - pos; speed > 0 && left/speed >= 0.5 {
+				line += fmt.Sprintf("  ~%s left", fmtSec(left/speed))
+			}
+		}
+		if speed > 0 {
+			line += fmt.Sprintf("  (%.1fx)", speed)
+		}
+		fmt.Printf("\r%-40s", line)
+		shown = true
+	})
+	if shown {
+		fmt.Println()
+	}
+}
+
+// parseProgress streams ffmpeg's -progress key=value feed, calling report once
+// per progress block with the position (seconds) and speed (× realtime).
+func parseProgress(r io.Reader, report func(pos, speed float64)) {
+	var pos, speed float64
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		k, v, _ := strings.Cut(sc.Text(), "=")
@@ -220,22 +243,8 @@ func showProgress(r io.Reader, durSec float64) {
 		case "speed":
 			speed, _ = strconv.ParseFloat(strings.TrimSuffix(strings.TrimSpace(v), "x"), 64)
 		case "progress":
-			line := fmt.Sprintf("▶ %s encoded", fmtSec(pos))
-			if durSec > 0 {
-				line = fmt.Sprintf("▶ %3.0f%%", min(pos/durSec, 1)*100)
-				if left := durSec - pos; speed > 0 && left/speed >= 0.5 {
-					line += fmt.Sprintf("  ~%s left", fmtSec(left/speed))
-				}
-			}
-			if speed > 0 {
-				line += fmt.Sprintf("  (%.1fx)", speed)
-			}
-			fmt.Printf("\r%-40s", line)
-			shown = true
+			report(pos, speed)
 		}
-	}
-	if shown {
-		fmt.Println()
 	}
 }
 
@@ -416,15 +425,40 @@ func plan(in string) decision {
 	// A bare stereo downmix plays several dB quieter than the source
 	// (swresample scales the mix down to clip-proof it), so each re-encoded
 	// track gets a measured static gain toward targetLUFS — a pure volume
-	// offset, dynamics untouched.
+	// offset, dynamics untouched. The measure passes are independent
+	// decode-only ffmpeg runs, CPU-bound in loudnorm's analysis, so they all
+	// run at once — one shared status line, result lines as each pass lands.
+	var need []int
 	for i := range d.audios {
-		if t := &d.audios[i]; !t.copy {
-			desc := ""
-			if len(d.audios) > 1 {
-				desc = fmt.Sprintf(" (track %d of %d, %s)", i+1, len(d.audios), t.name)
-			}
-			t.gainDB, t.hasGain = loudnessGain(in, t.idx, d.durSec, desc)
+		if !d.audios[i].copy {
+			need = append(need, i)
 		}
+	}
+	if len(need) > 0 {
+		track := func(i int) string {
+			if len(d.audios) == 1 {
+				return ""
+			}
+			return fmt.Sprintf(" (track %d of %d, %s)", i+1, len(d.audios), d.audios[i].name)
+		}
+		labels := make([]string, len(need))
+		if len(need) == 1 {
+			fmt.Printf("▶ Measuring loudness%s…\n", track(need[0]))
+		} else {
+			for s, i := range need {
+				labels[s] = d.audios[i].name
+			}
+			fmt.Printf("▶ Measuring loudness (%d tracks in parallel)…\n", len(need))
+		}
+		st := newLoudnessStatus(d.durSec, labels)
+		var wg sync.WaitGroup
+		for s, i := range need {
+			t := &d.audios[i]
+			wg.Go(func() {
+				t.gainDB, t.hasGain = loudnessGain(in, t.idx, s, st, track(i))
+			})
+		}
+		wg.Wait()
 	}
 	return d
 }
@@ -554,8 +588,7 @@ const downmix = "aformat=channel_layouts=stereo"
 // turned the gain into a −3.3 dB *cut*). Decode-only full pass — a minute or
 // two for a movie. ok=false means the measurement failed; the encode then
 // runs plain, as before.
-func loudnessGain(in string, idx int, durSec float64, desc string) (gain float64, ok bool) {
-	fmt.Printf("▶ Measuring loudness%s…\n", desc)
+func loudnessGain(in string, idx, slot int, st *loudnessStatus, desc string) (gain float64, ok bool) {
 	start := time.Now()
 	cmd := exec.Command("ffmpeg", "-hide_banner", "-nostats",
 		"-progress", "pipe:1", "-stats_period", "0.5",
@@ -564,18 +597,18 @@ func loudnessGain(in string, idx int, durSec float64, desc string) (gain float64
 		"-f", "null", os.DevNull)
 	var meas strings.Builder
 	cmd.Stderr = &meas // loudnorm prints its JSON on stderr at stream end
+	fail := func() (float64, bool) {
+		st.finish(slot, os.Stderr, "▶ Loudness measurement"+desc+" failed — encoding without gain")
+		return 0, false
+	}
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		return 0, false
+		return fail()
 	}
 	if err := cmd.Start(); err != nil {
-		return 0, false
+		return fail()
 	}
-	showProgress(out, durSec)
-	fail := func() (float64, bool) {
-		fmt.Fprintln(os.Stderr, "▶ Loudness measurement failed — encoding without gain")
-		return 0, false
-	}
+	parseProgress(out, func(pos, speed float64) { st.update(slot, pos, speed) })
 	if cmd.Wait() != nil {
 		return fail()
 	}
@@ -597,8 +630,77 @@ func loudnessGain(in string, idx int, durSec float64, desc string) (gain float64
 		return fail()
 	}
 	gain = targetLUFS - lufs
-	fmt.Printf("▶ Loudness %.1f LUFS (peak %+.1f dBTP) → %+.1f dB gain — took %s\n", lufs, tp, gain, took(start))
+	st.finish(slot, os.Stdout, fmt.Sprintf("▶ Loudness%s %.1f LUFS (peak %+.1f dBTP) → %+.1f dB gain — took %s",
+		desc, lufs, tp, gain, took(start)))
 	return gain, true
+}
+
+// loudnessStatus owns the terminal's status line while concurrent loudness
+// passes run: each pass updates its slot, the line redraws with every running
+// pass's percent plus the slowest pass's time-left, and finished passes'
+// result lines print above it. All terminal writes go through its lock.
+type loudnessStatus struct {
+	mu     sync.Mutex
+	durSec float64
+	labels []string  // cell prefix per slot ("" when there's just one pass)
+	pos    []float64 // seconds measured; -1 once the pass has finished
+	speed  []float64
+	width  int // widest line drawn, so \r redraws overwrite cleanly
+}
+
+func newLoudnessStatus(durSec float64, labels []string) *loudnessStatus {
+	return &loudnessStatus{durSec: durSec, labels: labels,
+		pos: make([]float64, len(labels)), speed: make([]float64, len(labels))}
+}
+
+func (s *loudnessStatus) update(slot int, pos, speed float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pos[slot], s.speed[slot] = pos, speed
+	s.draw()
+}
+
+// finish retires the slot's cell and prints line above the status line.
+func (s *loudnessStatus) finish(slot int, w io.Writer, line string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pos[slot] = -1
+	fmt.Printf("\r%-*s\r", s.width, "")
+	fmt.Fprintln(w, line)
+	s.draw()
+}
+
+func (s *loudnessStatus) draw() {
+	var cells []string
+	var left float64
+	for i, p := range s.pos {
+		if p < 0 {
+			continue
+		}
+		cell := fmtSec(p) + " measured"
+		if s.durSec > 0 {
+			cell = fmt.Sprintf("%3.0f%%", min(p/s.durSec, 1)*100)
+			if l := (s.durSec - p) / s.speed[i]; s.speed[i] > 0 && l >= 0.5 {
+				left = max(left, l)
+			}
+		}
+		if s.labels[i] != "" {
+			cell = s.labels[i] + " " + cell
+		}
+		if s.speed[i] > 0 {
+			cell += fmt.Sprintf(" (%.1fx)", s.speed[i])
+		}
+		cells = append(cells, cell)
+	}
+	if cells == nil {
+		return
+	}
+	line := "▶ " + strings.Join(cells, " · ")
+	if left > 0 {
+		line += fmt.Sprintf("  ~%s left", fmtSec(left))
+	}
+	s.width = max(s.width, len(line))
+	fmt.Printf("\r%-*s", s.width, line)
 }
 
 // audioFilter is the chain a re-encoded track runs through: stereo downmix,
