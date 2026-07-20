@@ -87,7 +87,7 @@ func main() {
 // fit returns a projector-ready file for the input, doing the least work
 // needed: probe first, then serve as-is / remux / re-encode audio / transcode.
 // Anything encoded lands in <name>-ready.mp4 next to the input (faststart MP4,
-// H.264 + AAC); an input that already fits in an mp4 container is served as-is.
+// HEVC + AAC); an input that already fits in an mp4 container is served as-is.
 func fit(in string) string {
 	out := filepath.Join(filepath.Dir(in), baseName(in)+"-ready.mp4")
 
