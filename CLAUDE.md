@@ -14,7 +14,7 @@ Personal Go tool: stream a local video from the Mac to a Wanbo Mozart 1 Pro proj
 - Discover: minimal UPnP/DLNA MediaServer — SSDP (answers M-SEARCH) + ContentDirectory SOAP; shows in VLC → Local Network as "project (Mac)"
 
 ## Testing
-- Test clip: `ffmpeg -f lavfi -i testsrc=duration=2:size=1280x720:rate=25 -f lavfi -i sine=duration=2 -pix_fmt yuv420p -c:v libx264 -c:a aac out.mkv`
+- Test clip: `ffmpeg -f lavfi -i testsrc=duration=2:size=1280x720:rate=25 -f lavfi -i sine=duration=2 -pix_fmt yuv420p -c:v libx264 -c:a aac out.mkv` (swap in `-c:a ac3 -ac 6` to exercise the loudness-measure/downmix/gain path — aac audio is fit and skips it; verify with an `ebur128` pass on the output → −16 LUFS)
 - Run binary in background, then wait for it: `curl -s --retry-connrefused --retry 40 --retry-delay 1 -r 0-0 -o /dev/null http://127.0.0.1:1111/` (`-r 0-0` matters: every path answers with the whole served file, so a bare GET downloads the entire movie)
 - SSDP: send an `M-SEARCH` UDP packet to 239.255.255.250:1900; expect a reply carrying `LOCATION`
 - Probing projector codec support (how HEVC hw decode was verified, 2026-07):
@@ -35,6 +35,7 @@ Personal Go tool: stream a local video from the Mac to a Wanbo Mozart 1 Pro proj
 - Do NOT cut test clips with `-ss` + `-c:v copy` + audio re-encode straight to mp4 in ONE ffmpeg pass — it bakes in a skewed A/V offset and VLC renders every frame 120-330 ms late (a steady "picture is too late" logcat storm, ~4/s, from network AND local playback alike). Cut to mkv first, then remux mp4 in a second pass (that plays clean, as does the tool's own whole-file remux). This artifact is what the 2026-07-20 copy-rung "failures" were — video stream, container, AAC and tool chain were each exonerated by isolation variants.
 - A bare `-ac 2` downmix of 5.1 plays ~6-7 dB quieter than the source (swresample clip-protection scales the mix down; dialogue suffers most) — why re-encoded audio gets the measured loudness gain. Measure on the *downmixed* signal, not the original channels.
 - Do NOT cap the loudness gain by whole-file peak: movie downmixes routinely peak over 0 dBTP (a real BDRip: −27 LUFS, +1.8 dBTP), so a peak cap inverts an +11 dB boost into a −3.3 dB cut. Boost fully, limit transients (`alimiter` — its `level` option defaults to *true* and would re-normalize away the gain; set `level=false:latency=true`).
+- Never measure loudness with `loudnorm` in measure mode — it resamples everything to 192 kHz internally, ~30x slower than `ebur128` at native rate (identical integrated LUFS, agreed to 0.05 LU). `ebur128` needs `framelog=verbose` (else per-100ms lines flood stderr) and `peak=sample` (true peak costs 4x oversampling; the gain is never peak-capped anyway).
 - Python `http.server` has NO Range support → breaks video seeking (why serving is custom Go)
 - macOS TCC blocks terminal reads of `~/Downloads` and `~/Documents` (`~/Desktop` is fine)
 - adb shell: single-quote the whole remote command (nested double quotes / globs get mangled); this zsh also expands bare `=word` args (`echo ===` errors)
