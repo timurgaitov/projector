@@ -106,8 +106,8 @@ func fit(in string) string {
 	switch {
 	case !d.ok || !d.vCopy:
 		fmt.Printf("▶ Transcoding (%s) → %s\n", d.why, filepath.Base(out))
-	case d.aIdx >= 0 && !d.aCopy:
-		fmt.Printf("▶ Video is fine — re-encoding audio only (audio %s) → %s\n", d.aName, filepath.Base(out))
+	case !allCopy(d.audios):
+		fmt.Printf("▶ Video is fine — re-encoding audio only (audio %s) → %s\n", reencNames(d.audios), filepath.Base(out))
 	default:
 		fmt.Printf("▶ Already fit — remuxing (lossless) → %s\n", filepath.Base(out))
 	}
@@ -116,12 +116,17 @@ func fit(in string) string {
 	// never leaves a half-encoded <name>-ready.mp4 for the cache to reuse.
 	tmp := out + ".part"
 	err := ffmpeg(in, tmp, codecArgs(d), d.durSec)
-	if err != nil && d.ok && (d.vCopy || d.aCopy) {
+	if err != nil && d.ok && (d.vCopy || anyCopy(d.audios)) {
 		// Streams that look fit can still refuse to copy into mp4 (bad
 		// timestamps, packed bitstreams); re-encoding regenerates them.
 		fmt.Fprintln(os.Stderr, "▶ Copy failed — retrying as a full transcode")
-		err = ffmpeg(in, tmp, codecArgs(decision{ok: true, vIdx: d.vIdx, aIdx: d.aIdx,
-			gainDB: d.gainDB, hasGain: d.hasGain}), d.durSec)
+		retry := d
+		retry.vCopy = false
+		retry.audios = append([]aTrack(nil), d.audios...)
+		for i := range retry.audios {
+			retry.audios[i].copy = false
+		}
+		err = ffmpeg(in, tmp, codecArgs(retry), d.durSec)
 	}
 	if err != nil {
 		os.Remove(tmp)
@@ -137,9 +142,40 @@ func fit(in string) string {
 }
 
 // isFit reports whether a probed file can be served without running ffmpeg at
-// all: already an mp4 whose video (and audio, if any) would be plain copies.
+// all: already an mp4 whose video (and audio, if any) would be plain copies,
+// with every audio track kept in file order — dropping or reordering tracks
+// needs a remux even when each stream is copy-clean.
 func isFit(d decision) bool {
-	return d.ok && d.isMP4 && d.vCopy && (d.aIdx < 0 || d.aCopy)
+	return d.ok && d.isMP4 && d.vCopy && d.allAudio && allCopy(d.audios)
+}
+
+func allCopy(ts []aTrack) bool {
+	for _, t := range ts {
+		if !t.copy {
+			return false
+		}
+	}
+	return true
+}
+
+func anyCopy(ts []aTrack) bool {
+	for _, t := range ts {
+		if t.copy {
+			return true
+		}
+	}
+	return false
+}
+
+// reencNames lists the codecs of the tracks a re-encode will touch, for messages.
+func reencNames(ts []aTrack) string {
+	var names []string
+	for _, t := range ts {
+		if !t.copy {
+			names = append(names, t.name)
+		}
+	}
+	return strings.Join(names, "+")
 }
 
 func ffmpeg(in, tmp string, codec []string, durSec float64) error {
@@ -204,24 +240,39 @@ func fmtSec(s float64) string {
 // decision is plan()'s verdict: which streams to use and how little work each
 // needs. The zero value (ok=false) means "probe failed, assume the worst".
 type decision struct {
-	ok           bool
-	vIdx, aIdx   int     // absolute stream indices; aIdx < 0 → no audio
-	vCopy, aCopy bool    // stream already fits the target → plain copy
-	isMP4        bool    // container is already mp4/mov
-	aName        string  // audio codec name, for messages
-	why          string  // short reason when the video needs a transcode
-	durSec       float64 // input duration in seconds; 0 if unknown
-	gainDB       float64 // static loudness gain for re-encoded audio
-	hasGain      bool    // gainDB was actually measured
+	ok       bool
+	vIdx     int      // absolute video stream index
+	vCopy    bool     // video already fits the target → plain copy
+	audios   []aTrack // kept audio tracks, in output order; empty → no audio
+	allAudio bool     // kept every input audio track, in file order
+	isMP4    bool     // container is already mp4/mov
+	why      string   // short reason when the video needs a transcode
+	durSec   float64  // input duration in seconds; 0 if unknown
+}
+
+// aTrack is one audio stream of the input plus plan()'s verdict for it.
+type aTrack struct {
+	idx      int    // absolute stream index
+	name     string // codec name
+	lang     string // language tag; "" or "und" when absent
+	layout   string // channel layout, e.g. "5.1(side)"
+	channels int
+	title    string
+	def      bool    // marked default in the input
+	br       int     // bits/s; 0 when the container doesn't say
+	copy     bool    // already aac → plain copy
+	gainDB   float64 // static loudness gain when re-encoded
+	hasGain  bool    // gainDB was actually measured
 }
 
 // plan probes the input with ffprobe and decides, per stream, whether a copy
 // suffices. Video fits if it's 8-bit 4:2:0 h264 within 1080p and the projected
 // output bitrate stays under maxOverall — both the average and the measured
-// 1-second peak (a full-file packet scan). Audio fits if it's already aac.
+// 1-second peak (a full-file packet scan). Audio fits if it's already aac;
+// when the input carries several audio tracks the user picks which to keep.
 // Any probe failure falls back to a full transcode (safe default).
 func plan(in string) decision {
-	d := decision{aIdx: -1}
+	d := decision{}
 	out, err := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json",
 		"-show_format", "-show_streams", in).Output()
 	if err != nil {
@@ -230,15 +281,22 @@ func plan(in string) decision {
 	}
 	var p struct {
 		Streams []struct {
-			Index       int    `json:"index"`
-			CodecType   string `json:"codec_type"`
-			CodecName   string `json:"codec_name"`
-			PixFmt      string `json:"pix_fmt"`
-			Width       int    `json:"width"`
-			Height      int    `json:"height"`
-			BitRate     string `json:"bit_rate"`
+			Index         int    `json:"index"`
+			CodecType     string `json:"codec_type"`
+			CodecName     string `json:"codec_name"`
+			PixFmt        string `json:"pix_fmt"`
+			Width         int    `json:"width"`
+			Height        int    `json:"height"`
+			BitRate       string `json:"bit_rate"`
+			Channels      int    `json:"channels"`
+			ChannelLayout string `json:"channel_layout"`
+			Tags          struct {
+				Language string `json:"language"`
+				Title    string `json:"title"`
+			} `json:"tags"`
 			Disposition struct {
 				AttachedPic int `json:"attached_pic"`
+				Default     int `json:"default"`
 			} `json:"disposition"`
 		} `json:"streams"`
 		Format struct {
@@ -255,13 +313,18 @@ func plan(in string) decision {
 
 	// Pick the real video stream — cover art is also codec_type "video", and
 	// ffmpeg's 0:v:N counts it too, so streams are mapped by absolute index.
-	vi, ai := -1, -1
+	vi := -1
+	var tracks []aTrack
 	for i, s := range p.Streams {
-		if s.CodecType == "video" && s.Disposition.AttachedPic == 0 && vi < 0 {
+		switch {
+		case s.CodecType == "video" && s.Disposition.AttachedPic == 0 && vi < 0:
 			vi = i
-		}
-		if s.CodecType == "audio" && ai < 0 {
-			ai = i
+		case s.CodecType == "audio":
+			br, _ := strconv.Atoi(s.BitRate)
+			tracks = append(tracks, aTrack{idx: s.Index, name: s.CodecName,
+				lang: s.Tags.Language, layout: s.ChannelLayout, channels: s.Channels,
+				title: s.Tags.Title, def: s.Disposition.Default == 1, br: br,
+				copy: s.CodecName == "aac"})
 		}
 	}
 	if vi < 0 {
@@ -272,18 +335,17 @@ func plan(in string) decision {
 	d.ok, d.vIdx = true, v.Index
 	d.isMP4 = strings.Contains(p.Format.FormatName, "mp4")
 
-	abr := 0
-	if ai >= 0 {
-		d.aIdx = p.Streams[ai].Index
-		d.aName = p.Streams[ai].CodecName
-		d.aCopy = d.aName == "aac"
-		abr, _ = strconv.Atoi(p.Streams[ai].BitRate)
+	d.audios = chooseAudio(tracks)
+	d.allAudio = len(d.audios) == len(tracks)
+	for i := 0; d.allAudio && i < len(tracks); i++ {
+		d.allAudio = d.audios[i].idx == tracks[i].idx
 	}
 
 	d.durSec, _ = strconv.ParseFloat(p.Format.Duration, 64)
 
 	// Overall bitrate; derive it from size/duration when the container doesn't
-	// carry one. Re-encoded audio swaps its weight for the AAC target.
+	// carry one. Dropped tracks' weight comes off; re-encoded ones swap theirs
+	// for the AAC target.
 	overall, _ := strconv.Atoi(p.Format.BitRate)
 	if overall <= 0 {
 		size, _ := strconv.Atoi(p.Format.Size)
@@ -292,8 +354,17 @@ func plan(in string) decision {
 		}
 	}
 	projected := overall
-	if ai >= 0 && !d.aCopy && abr > 0 {
-		projected = overall - abr + audioBitrate
+	for _, t := range tracks {
+		kept := false
+		for _, k := range d.audios {
+			kept = kept || k.idx == t.idx
+		}
+		switch {
+		case !kept && t.br > 0:
+			projected -= t.br
+		case kept && !t.copy && t.br > 0:
+			projected += audioBitrate - t.br
+		}
 	}
 	switch {
 	case v.CodecName != "h264" || v.PixFmt != "yuv420p":
@@ -321,13 +392,88 @@ func plan(in string) decision {
 	}
 
 	// A bare stereo downmix plays several dB quieter than the source
-	// (swresample scales the mix down to clip-proof it), so re-encoded audio
-	// gets a measured static gain toward targetLUFS — a pure volume offset,
-	// dynamics untouched.
-	if d.aIdx >= 0 && !d.aCopy {
-		d.gainDB, d.hasGain = loudnessGain(in, d.aIdx, d.durSec)
+	// (swresample scales the mix down to clip-proof it), so each re-encoded
+	// track gets a measured static gain toward targetLUFS — a pure volume
+	// offset, dynamics untouched.
+	for i := range d.audios {
+		if t := &d.audios[i]; !t.copy {
+			desc := ""
+			if len(d.audios) > 1 {
+				desc = fmt.Sprintf(" (track %d of %d, %s)", i+1, len(d.audios), t.name)
+			}
+			t.gainDB, t.hasGain = loudnessGain(in, t.idx, d.durSec, desc)
+		}
 	}
 	return d
+}
+
+// chooseAudio asks which audio tracks to keep when the input has several —
+// numbers in the order they should land in the output (the first kept track
+// becomes the output's default). Enter, EOF, or a non-interactive stdin keep
+// just the input's default track, matching the old single-track behavior.
+func chooseAudio(tracks []aTrack) []aTrack {
+	if len(tracks) <= 1 {
+		return tracks
+	}
+	def := 0
+	for i, t := range tracks {
+		if t.def {
+			def = i
+			break
+		}
+	}
+	fmt.Printf("▶ %d audio tracks:\n", len(tracks))
+	for i, t := range tracks {
+		fmt.Printf("  %2d. %s\n", i+1, t.describe())
+	}
+	sc := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Printf("▶ Keep which? (e.g. 1 3 — first kept becomes default; Enter = %d) ", def+1)
+		if !sc.Scan() || strings.TrimSpace(sc.Text()) == "" {
+			fmt.Printf("▶ Keeping track %d\n", def+1)
+			return tracks[def : def+1]
+		}
+		var sel []aTrack
+		seen := map[int]bool{}
+		ok := true
+		for f := range strings.FieldsSeq(sc.Text()) {
+			n, err := strconv.Atoi(f)
+			if ok = err == nil && n >= 1 && n <= len(tracks) && !seen[n]; !ok {
+				break
+			}
+			seen[n] = true
+			sel = append(sel, tracks[n-1])
+		}
+		if ok {
+			return sel
+		}
+		fmt.Printf("▶ Track numbers 1-%d, no repeats\n", len(tracks))
+	}
+}
+
+// describe renders one picker line, e.g. `rus ac3 5.1(side) 448 kbps "Dub"`.
+func (t aTrack) describe() string {
+	var parts []string
+	if t.lang != "" && t.lang != "und" {
+		parts = append(parts, t.lang)
+	}
+	parts = append(parts, t.name)
+	switch {
+	case t.layout != "":
+		parts = append(parts, t.layout)
+	case t.channels > 0:
+		parts = append(parts, fmt.Sprintf("%dch", t.channels))
+	}
+	if t.br > 0 {
+		parts = append(parts, fmt.Sprintf("%d kbps", t.br/1000))
+	}
+	if t.title != "" {
+		parts = append(parts, `"`+t.title+`"`)
+	}
+	if t.def {
+		parts = append(parts, "(default)")
+	}
+	return strings.Join(parts, "  ")
 }
 
 // peakBitrate returns the video stream's worst 1-second bitrate (bits/s),
@@ -385,8 +531,8 @@ const downmix = "aformat=channel_layouts=stereo"
 // turned the gain into a −3.3 dB *cut*). Decode-only full pass — a minute or
 // two for a movie. ok=false means the measurement failed; the encode then
 // runs plain, as before.
-func loudnessGain(in string, idx int, durSec float64) (gain float64, ok bool) {
-	fmt.Println("▶ Measuring loudness…")
+func loudnessGain(in string, idx int, durSec float64, desc string) (gain float64, ok bool) {
+	fmt.Printf("▶ Measuring loudness%s…\n", desc)
 	cmd := exec.Command("ffmpeg", "-hide_banner", "-nostats",
 		"-progress", "pipe:1", "-stats_period", "0.5",
 		"-i", in, "-map", fmt.Sprintf("0:%d", idx),
@@ -431,23 +577,23 @@ func loudnessGain(in string, idx int, durSec float64) (gain float64, ok bool) {
 	return gain, true
 }
 
-// aac_at is Apple's AudioToolbox encoder — better than ffmpeg's built-in aac
-// at the same bitrate, and always present in macOS ffmpeg builds.
-func audioArgs(d decision) []string {
+// audioFilter is the chain a re-encoded track runs through: stereo downmix,
+// the measured loudness gain, then a lookahead limiter taming the split-second
+// overs (downmix channel summation, boosted transients) that would otherwise
+// clip at the encoder; everything under the ceiling passes untouched.
+// level=false — its default auto-level would re-normalize and undo the gain;
+// latency=true keeps A/V sync across the lookahead delay.
+func audioFilter(t aTrack) string {
 	f := downmix
-	if d.hasGain {
-		f += fmt.Sprintf(",volume=%.2fdB", d.gainDB)
+	if t.hasGain {
+		f += fmt.Sprintf(",volume=%.2fdB", t.gainDB)
 	}
-	// Lookahead limiter tames the split-second overs (downmix channel
-	// summation, boosted transients) that would otherwise clip at the encoder;
-	// everything under the ceiling passes untouched. level=false — its default
-	// auto-level would re-normalize and undo the gain; latency=true keeps A/V
-	// sync across the lookahead delay.
-	f += fmt.Sprintf(",alimiter=limit=%.4f:level=false:latency=true", math.Pow(10, maxTruePeak/20))
-	return []string{"-c:a", "aac_at", "-b:a", strconv.Itoa(audioBitrate), "-af", f}
+	return f + fmt.Sprintf(",alimiter=limit=%.4f:level=false:latency=true", math.Pow(10, maxTruePeak/20))
 }
 
 // codecArgs returns the ffmpeg stream-selection and codec flags for a decision.
+// aac_at is Apple's AudioToolbox encoder — better than ffmpeg's built-in aac
+// at the same bitrate, and always present in macOS ffmpeg builds.
 func codecArgs(d decision) []string {
 	full := []string{
 		"-vf", fmt.Sprintf("scale=w='min(%d,iw)':h='min(%d,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
@@ -460,22 +606,38 @@ func codecArgs(d decision) []string {
 		"-b:v", targetBitrate, "-maxrate", targetBitrate, "-bufsize", targetBufsize,
 	}
 	if !d.ok { // probe failed: transcode whatever streams are there
-		return append(append([]string{"-map", "0:v:0", "-map", "0:a:0?"}, full...), audioArgs(d)...)
+		return append(append([]string{"-map", "0:v:0", "-map", "0:a:0?"}, full...),
+			"-c:a", "aac_at", "-b:a", strconv.Itoa(audioBitrate), "-af", audioFilter(aTrack{}))
 	}
 	args := []string{"-map", fmt.Sprintf("0:%d", d.vIdx)}
-	if d.aIdx >= 0 {
-		args = append(args, "-map", fmt.Sprintf("0:%d", d.aIdx))
+	for _, t := range d.audios {
+		args = append(args, "-map", fmt.Sprintf("0:%d", t.idx))
 	}
 	if d.vCopy {
 		args = append(args, "-c:v", "copy")
 	} else {
 		args = append(args, full...)
 	}
-	if d.aIdx >= 0 {
-		if d.aCopy {
-			args = append(args, "-c:a", "copy")
+	for n, t := range d.audios {
+		if t.copy {
+			args = append(args, fmt.Sprintf("-c:a:%d", n), "copy")
 		} else {
-			args = append(args, audioArgs(d)...)
+			args = append(args, fmt.Sprintf("-c:a:%d", n), "aac_at",
+				fmt.Sprintf("-b:a:%d", n), strconv.Itoa(audioBitrate),
+				fmt.Sprintf("-filter:a:%d", n), audioFilter(t))
+		}
+		// First kept track becomes the output's default; clear the flag on the
+		// rest so players don't inherit a stray default from the source.
+		disp := "0"
+		if n == 0 {
+			disp = "default"
+		}
+		args = append(args, fmt.Sprintf("-disposition:a:%d", n), disp)
+		// mp4 drops the mkv "title" tag; handler_name is what the mov muxer
+		// writes (and VLC's track menu shows) — without it same-language
+		// tracks are indistinguishable on the projector.
+		if t.title != "" {
+			args = append(args, fmt.Sprintf("-metadata:s:a:%d", n), "handler_name="+t.title)
 		}
 	}
 	return args
