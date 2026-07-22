@@ -709,12 +709,17 @@ func (s *loudnessStatus) draw() {
 // clip at the encoder; everything under the ceiling passes untouched.
 // level=false — its default auto-level would re-normalize and undo the gain;
 // latency=true keeps A/V sync across the lookahead delay.
+// attack/release/asc: the default 50ms release chases individual bass cycles
+// when a boosted loud scene sits over the ceiling for seconds (~1.7% THD on a
+// sustained 40Hz over — audible creaking on dense theatrical mixes; a dub's
+// sparser loud scenes hide it). 500ms + asc settles to a constant scene-level
+// gain instead — measured transparent on the same tone.
 func audioFilter(t aTrack) string {
 	f := downmix
 	if t.hasGain {
 		f += fmt.Sprintf(",volume=%.2fdB", t.gainDB)
 	}
-	return f + fmt.Sprintf(",alimiter=limit=%.4f:level=false:latency=true", math.Pow(10, maxTruePeak/20))
+	return f + fmt.Sprintf(",alimiter=limit=%.4f:level=false:latency=true:attack=15:release=500:asc=1", math.Pow(10, maxTruePeak/20))
 }
 
 // codecArgs returns the ffmpeg stream-selection and codec flags for a decision.
